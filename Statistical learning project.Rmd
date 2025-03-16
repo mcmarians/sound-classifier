@@ -1,0 +1,1081 @@
+---
+output: html_document
+---
+
+# SL Homework 
+
+## Part 1 - Classification and Visualizzation of music genres
+
+
+### Introduction
+
+We have some songs of 30 secs and we want to classify them by their genre. Our train set consist in 150 songs with their labels. The idea is use Short Time Fourier Transform (STFT) coefficient and to obtain, from them, some features useful for the classification. In particular the STFT coefficients are complex numbers so we extract features from both real and imaginary part. Another important point is we don't focus the work on the entire songs but we split each of them into sequences and we work independently on each one. So we try different models for the classification and we obtain accuracy value taking the most common label of sequences for each songs. The final result we obtained is an accuracy of $\sim$ 94% using random forest algorithm.
+
+
+### Load Libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(wrassp)
+library(tuneR)
+library(MASS)
+suppressPackageStartupMessages( require(signal, quietly = TRUE) )
+suppressMessages(require(caret, quietly = T))
+suppressMessages(require(e1071, quietly = T))
+suppressMessages(require(glmnet, quietly = T))
+library(randomForest)
+library(corrplot)
+library(doParallel)
+```
+
+
+### 1 - Classification
+
+#### Load functions we create for the analysis
+
+That function takes in input an audio file name and returns:
+
+- data: the frequency vector of the songs with reduce sampling rate
+
+- coef: the STFT coefficients
+
+- fs: sampling rate
+
+- nfft: size of window 
+
+A unique consideration we could do on that function, is that we decide to overlap the sequences for $\frac{1}{4} = \frac{512}{2048}$ in number of samples. This value can be changed to optimize the classification.
+
+```{r}
+load_and_STFT <- function(file){
+  # Load
+  x <- read.AsspDataObj(file)
+  # cast for tuneR
+  xwv <- Wave( as.numeric(x$audio), samp.rate = rate.AsspDataObj(x), bit = 16)
+  # Reduce the sample
+  xw.dwn = downsample(xwv, samp.rate = 11025)
+  
+  fs <- xw.dwn@samp.rate # sampling rate
+  winsize <- 2048 # time-windowing (in number of samples, power of 2 for the FFT)
+  hopsize <- 512 # windows overlap (in number of samples)
+  nfft <- 2048
+  # noverlap <- winsize - hopsize # 1536
+  # Compute STFT
+  sp <- specgram(x = xw.dwn@left, n = nfft, Fs = fs, window = winsize, overlap = hopsize)
+  
+  return(list("data"=xw.dwn@left, "coef"=sp$S, "fs"=fs, "nfft"=nfft))
+}
+
+```
+
+
+With that function we compute the Zero Crossing Rate feature. 
+
+Simply given in input a vector we compute how much time need to change the sign. So in output we have these time intervals.
+
+```{r}
+# Zero Crossing Rate function
+compute_zcr <- function(data){
+  dist<-c()
+  for(i in 1:(length(data)-1)){
+    last_cross <- 0
+    if(data[i]*data[i+1]<=0){
+      dist <- c( dist, ((i+1)-last_cross) )
+      last_cross<-(i+1)
+      i <- i+1
+    }
+  }
+  return(mean(dist[-1]))
+}
+```
+
+
+Here we create a function that computes some classical statistical features like the min and max, the mean and the standard deviation and also the zero crossing rate using the function above.
+
+```{r}
+# Some statistical features
+extract_feature <- function(data_seq){
+  min_xw <- min(data_seq)
+  max_xw <- max(data_seq)
+  mean_xw <- mean(data_seq)
+  sd_xw <- sd(data_seq)
+  # Zero crossing rate
+  zcr_xw <- compute_zcr(data_seq)
+  
+  feat <-as.numeric(c(min_xw, max_xw, mean_xw, sd_xw, zcr_xw))
+
+  return( feat )
+}
+```
+
+This function compute the energy for 8 frequency bands (not uniform but logarithmic).
+Usign Parseval identity we can compute this values directly from the STFT coefficients. 
+The output will be a matrix where the rows are the 8 frequency bands and the columns are the sequences for each songs.
+```{r}
+# Energy function
+compute_energy <- function(data, nb=2^3, lowB=100, fs, nfft) {
+  
+  ntm <- dim(data)[2]
+  
+  eps <- .Machine$double.eps # machine precision to avoid over/underflow
+  
+  corrtime <- 15 # number of seconds to consider
+  
+  # Energy of bands
+  fco <- round( c(0, lowB*(fs/2/lowB)^((0:(nb-1))/(nb-1)))/fs*nfft )
+  energy <- matrix(0, nb, ntm)
+  for (tm in 1:ntm){
+    for (i in 1:nb){
+      lower_bound <- 1 + fco[i]
+      upper_bound <- min( c( 1 + fco[i + 1], nrow(data) ) )
+      energy[i, tm] <- as.numeric(sum( abs(data[ lower_bound:upper_bound, tm ])^2 ))
+    }
+  }
+  energy[energy < eps] <- eps
+  energy = 10*log10(energy)
+  
+  return(energy)
+}
+```
+
+These two simply functions extract from a complex number the real and the imaginary part.
+This is probably the main idea of our work, because we can't extract statistical features from a complex number so we decide to obtain them from both real and imaginary part.
+
+```{r}
+# function to extract real and imaginary part
+real_part <- function(comp){ return( Re(comp) ) }
+imm_part <- function(comp){ return( Im(comp) ) }
+```
+
+The last function we created for this section resume all the previous. It takes in input the STFT coefficient and first of all it compute the 8 energy features. Then it creates two dataframes for both real and imaginary part of the coefficients. From each dataframe we compute the other 5 statistical features. 
+
+The output of the function is a dataframe where the columns are the 19 features and the rows are the sequences of the considered song.
+
+```{r}
+build_feature_df <- function(stft_res){
+  energy_feat <- compute_energy(stft_res$coef, fs = stft_res$fs, nfft = stft_res$nfft)
+  
+  re_data <- sapply(as.data.frame(t(stft_res$coef)), FUN=real_part)
+  real_feat <- apply(re_data, 1, extract_feature)
+  
+  im_data <- sapply(as.data.frame(t(stft_res$coef)), FUN=imm_part)
+  im_feat <- apply(im_data, 1, extract_feature)
+  
+  feat_df <- as.data.frame(cbind(t(energy_feat),t(real_feat),t(im_feat)))
+  
+  return(feat_df)
+}
+```
+
+
+#### Load Labels
+
+```{r LABEL}
+txt <- read.csv("hw_data/Labels.txt", header = TRUE, sep = " ")
+label <- txt$x
+```
+
+
+#### Create features dataframe for all the songs
+
+The idea is to classify independently each sequence and all the sequences that belong to the same song will be gather and the most common label will decide the final one.
+
+So a variable that need an explanation is "len_seqs". In this variable we repeat the number of current song  (we are extracting the features) for its number of sequences times. With this vector we will reconstruct the songs from their sequences.
+
+```{r FEAT_DF}
+# initialize the vector for the tag of songs
+len_seqs <- c()
+
+# we compute the STFT coefficients and we extract the features
+res <- load_and_STFT("hw_data/f1.au")
+feat_df <- build_feature_df(res)
+# we save the number of sequences
+n_seqs <- dim(t(res$coef))[1]
+# we save the label of each sequence
+lab_seq <- as.vector(rep(label[1], n_seqs ))
+# we add the tag of the song for n_seqs times
+len_seqs <- c(len_seqs, rep(1, n_seqs) )
+
+# add all other coefficients, labels and features in the same way
+for(i in 2:150){
+  res <- load_and_STFT(paste("hw_data/f",as.character(i),".au", sep = ""))
+  feat_df_temp <- build_feature_df(res)
+  n_seqs <- dim(t(res$coef))[1]
+  
+  feat_df <- rbind(feat_df, feat_df_temp)
+  lab_seq <- c(lab_seq, as.vector(rep(label[i], n_seqs )))
+  
+  # song identifier to rebuilt the sequences for each song
+  len_seqs <- c(len_seqs, rep(i, n_seqs) )
+  
+  
+}
+
+# at the end we add column of the labels
+feat_df <- cbind(lab_seq, feat_df)
+
+# and we update the names of the features
+names(feat_df) <- c("id", "En1", "En2", "En3", "En4", "En5", "En6", "En7", "En8",
+                    "MinRe", "MaxRe", "MeanRe", "SdRe", "ZcrRe",
+                    "MinIm", "MaxIm", "MeanIm", "SdIm", "ZcrIm")
+```
+
+#### Check the correlation
+
+```{r CORR}
+corDF = cor(feat_df[,-1]);
+corrplot(corDF, method="number", tl.cex = 0.9, number.cex = 0.5, bg = "gray", addgrid.col = "black")
+```
+
+We can see some interesting things: 
+- The energy bands are more correleted as much they are close. 
+- There's an high correlation among Min, Max and Sd for real and imaginary part
+
+We could exclude some variables to avoid multicollinearity but in the end, doing some trials,  we decide to don't exclude none.
+
+
+#### Create train and test sets
+
+Here we split the data in train and test to build the models and check their accuracies.
+We decide to consider as proportion 80% for train and 20% for test.
+
+It is important to remember to split, in the same way, the tags to rebuild the songs from the sequences.
+
+```{r}
+set.seed(1234)
+idx.tr = createDataPartition(y = feat_df$id, p = .8, list = FALSE)
+
+data.tr = feat_df[ idx.tr, ]
+data.te = feat_df[-idx.tr, ]
+
+len_seqs.tr = len_seqs[idx.tr]
+len_seqs.te = len_seqs[-idx.tr]
+
+# check  how much songs in test for each genre
+table(data.te$id)
+```
+
+#### Function to obtain unique label 
+
+Here we create a function that, given the labels of all the sequences of the same songs, return the most common label.
+
+```{r}
+get_majority <- function(pred , ind_seq){
+  n = length(unique(ind_seq))
+  pred_label = rep(NA,n)
+  for(i in 1:n){
+    # here we obtain the most common label
+    pred_label[i] <- names(which.max(table(pred[which(ind_seq==i)])))
+  }
+  return(pred_label)
+}
+```
+
+
+#### All model we tried
+
+1) LDA model
+
+```{r LDA}
+mod_lda = lda(id ~ ., data = data.tr)
+pred_lda = predict(mod_lda, data.te[,-1])
+# see the results
+final_pred_lda <- get_majority(pred_lda$class,len_seqs.te)
+right_label <- get_majority(data.te[,1],len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_lda != right_label)*100)))
+table(final_pred_lda, right_label)
+```
+
+2) QDA model
+
+```{r QDA}
+mod_qda = qda(id ~ ., data = data.tr)
+pred_qda = predict(mod_qda, data.te[,-1])
+# see the results
+final_pred_qda <- get_majority(pred_qda$class,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_qda != right_label)*100)))
+table(final_pred_qda, right_label)
+```
+
+
+3) Naive Bayes model
+
+```{r NB}
+mod_NB = naiveBayes(as.factor(id) ~ ., data = data.tr, type = "raw")
+pred_NB = predict(mod_NB, data.te[,-1])
+final_pred_NB <- get_majority(pred_NB,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_NB != right_label)*100)))
+table(final_pred_NB, right_label)
+```
+
+
+4) KNN
+
+This takes a lot of times so we load only the plot with the final result.
+
+
+```{r KNN, eval=FALSE}
+set.seed(1234)
+registerDoParallel(cores=4)
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+knn_fit <- train(id ~ .,
+                 data = data.tr, method = "knn",
+                 trControl  = trctrl,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+# Take a look
+print(paste("Best parameter:", as.character(knn_fit$bestTune)))
+plot(knn_fit)
+```
+
+<center>![KNN tuning parameter plot](KNN_tuning_plot.png)</center>
+
+And then using the best parameter we obtain is k=17, so we re-run the model with this one:
+
+```{r KNN2}
+mod_KNN_best <- class::knn(data.tr[,-1], data.te[,-1], data.tr[,1], k = 17, prob = T)
+# see the results
+final_pred_KNN_best <- get_majority(mod_KNN_best,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_KNN_best != right_label)*100)))
+table(final_pred_KNN_best, right_label)
+```
+
+
+5) Lasso
+
+```{r LASSO}
+mod_LASSO = cv.glmnet(as.matrix(data.tr[,-1]), data.tr[,1], family = "multinomial", 
+                      type.measure = "class",
+                      parallel = T)
+
+print(log(c("min" = mod_LASSO$lambda.min, "1se" = mod_LASSO$lambda.1se)))
+
+# With lambda that minimize error
+pred_LASSOa = predict(mod_LASSO, newx = as.matrix(data.te[,-1]), type = "class", s = mod_LASSO$lambda.1se)
+# See results
+final_pred_Lassoa <- get_majority(pred_LASSOa,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_Lassoa != right_label)*100)))
+table(final_pred_Lassoa, right_label)
+
+# With lambda that minimize 1se
+pred_LASSOb = predict(mod_LASSO, newx = as.matrix(data.te[,-1]), type = "class", s = mod_LASSO$lambda.min)
+# See results
+final_pred_Lassob <- get_majority(pred_LASSOb,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_Lassob != right_label)*100)))
+table(final_pred_Lassob, right_label)
+```
+
+
+6) Random Forest
+
+Tuning parameter
+
+WARNING: it takes a looooot of time. We display the plot with the result.
+
+```{r RF TUNING, eval=FALSE}
+set.seed(1234)
+registerDoParallel(cores=4)
+control <- trainControl(method="repeatedcv", number=10, repeats=3, search="random")
+rf_random <- train(id ~ ., data = data.tr, method="rf", metric="Accuracy", tuneLength=15, trControl=control)
+print(rf_random)
+plot(rf_random)
+
+print(rf_random$bestTune)
+```
+
+
+
+<center>![RF tuning parameter plot](RF_tuning_plot.png)</center>
+
+
+The best result is obtained for "mtry" = 10. So we run again with that value.
+
+```{r RF}
+set.seed(1234)
+mod_rf <- randomForest(id ~ ., data = data.tr, importance = TRUE, mtry=10)
+pred_rf = predict(mod_rf, data.te[,-1])
+# see the results
+final_pred_RF <- get_majority(pred_rf,len_seqs.te)
+print(paste("Accuracy", as.character(100-mean(final_pred_RF != right_label)*100)))
+table(final_pred_RF, right_label)
+```
+
+
+#### Conclusion
+
+The models give these accuracies:
+
+- LDA: 60.66 %
+
+- QDA: 63.33 %
+
+- Naive Bayes: 53.33 %
+
+- KNN: 47.33 %
+
+- Lasso: 60% and 58.66%
+
+- Random Forest: 94%
+
+So in the end we can conclude that the best one is for sure Random Forest.
+
+
+
+### 2 - Visualizzation of data
+
+
+**General plot**
+
+Here we show the general scatterplot with all the data points (the songs), labeled with their genres, and the result we want to find is to have groups made by songs of the same genre quite clearly separated.
+
+```{r,warning=FALSE,message=FALSE}
+df <- data.frame(feat_df$En2, feat_df$En8,len_seqs)
+names(df) <- c("En2", "En8", "len_seqs")
+
+agg = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg['genre'] <- label
+
+qplot(agg$En2, agg$En8, colour = agg$genre, xlim = c(0,15))
+```
+
+The result is similar to the "middle part" of the emotions plot we had as example: in fact, as in the example of the display of emotions, which in the central part had "similar" emotions, even in our plot we find that some musical genres are in some aspects similar for the characteristics considered and therefore is not simple to clusterize.
+
+On the other hand, having quite defined and collected clusters, the genres that instead are very different (for example metal and reggae) are among them of very simple clusterization.
+
+So we can say that we find well defined groups for each genre, but these groups, for some particulare genres (for example hiphop and reggae) are not really separated. Probably that's why some songs are a mixture of musical genres.
+
+Now we continue the analysis and we try to visualize for each pair, the scatterplot of the songs, using the same features we used above for the general plot, in order to underline the different and similar genres:
+
+
+**Metal and Reggae**
+
+```{r}
+agg <- agg[agg$genre == "metal" | agg$genre == "reggae",]
+
+qplot(agg$En2, agg$En8, colour = agg$genre, xlim = c(0,15))
+
+```
+
+These pair of genres could be well separated by an hyperplane; this means these genres are really different and we can easily clusterize them.
+
+**Metal and Country**
+
+```{r}
+agg2 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg2['genre'] <- label
+
+
+agg2<- agg2[agg2$genre == "metal" | agg2$genre == "country",]
+
+qplot(agg2$En2, agg2$En8, colour = agg2$genre, xlim = c(0,15))
+```
+
+Metal and country could be separated by an hyperplane, with a little margin of error; this means these genres are quite different and we can clusterize them.
+
+**Metal and Hiphop**
+
+```{r,warning=FALSE,message=FALSE}
+agg3 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg3['genre'] <- label
+
+agg3 <- agg3[agg3$genre == "metal" | agg3$genre == "hiphop",]
+
+qplot(agg3$En2, agg3$En8, colour = agg3$genre, xlim = c(0,15))
+```
+
+Here the situation is the same of the previous couple, so we could be quite sure in the clusterization of a data point if we are in doubt with these two genres.
+
+**Metal and Rock**
+
+```{r}
+agg4 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg4['genre'] <- label
+
+
+agg4 <- agg4[agg4$genre == "metal" | agg4$genre == "rock",]
+
+qplot(agg4$En2, agg4$En8, colour = agg4$genre, xlim = c(0,15))
+```
+
+Metal and rock are two genres quite similare, in fact the two clusters overlap a little, so it's not so easy to choose the class of a new data point.
+But of course, this is expected for us, because Metal and Rock are similar.
+
+**Rock and Reggae**
+
+```{r}
+agg5 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg5['genre'] <- label
+
+agg5 <- agg5[agg5$genre == "rock" | agg5$genre == "reggae",]
+
+qplot(agg5$En2, agg5$En8, colour = agg5$genre, xlim = c(0,15))
+```
+
+Here we have a good situation, so we can separate these two genres by an hyperplane, because we have good clusters.
+
+**Rock and hiphop**
+
+```{r,warning=FALSE}
+agg6 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg6['genre'] <- label
+
+agg6 <- agg6[agg6$genre == "rock" | agg6$genre == "hiphop",]
+
+qplot(agg6$En2, agg6$En8, colour = agg6$genre, xlim = c(0,15))
+```
+
+Rock and hiphop seems to be similar from the scatterplot did with our features, and this for us isn't so clear.
+Of course, now we can find a lot of examples of songs that are a mixture of genres, maybe we are in this case.
+
+**Rock and Country**
+
+```{r}
+agg7 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg7['genre'] <- label
+
+agg7 <- agg7[agg7$genre == "rock" | agg7$genre == "country",]
+
+qplot(agg7$En2, agg7$En8, colour = agg7$genre, xlim = c(0,15))
+```
+
+Similar situation for Rock and country and the previous couple of genres, but for these two genres the classification of a new data point could be very hard beacuse of the overlapping of the two clusters.
+
+**Country and Reggae**
+
+```{r}
+agg8 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg8['genre'] <- label
+
+agg8 <- agg8[agg8$genre == "country" | agg8$genre == "reggae",]
+
+qplot(agg8$En2, agg8$En8, colour = agg8$genre, xlim = c(0,15))
+```
+
+For these genres we can find a good way to separate the plane, so we are in a good position to clusterize them in this case.
+
+**Country and Hiphop**
+
+```{r}
+agg9 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg9['genre'] <- label
+
+agg9 <- agg9[agg9$genre == "country" | agg9$genre == "hiphop",]
+
+qplot(agg9$En2, agg9$En8, colour = agg9$genre, xlim = c(0,15))
+```
+
+In this case we can try to find a good hyperplane between the two genres, but we will have a bit of error because some hiphop songs seems to be in the cluster of country songs.
+
+**Hiphop and Reggae**
+
+```{r}
+agg10 = aggregate(df,
+                by = list(df$len_seqs),
+                FUN = sd)
+
+agg10['genre'] <- label
+
+agg10 <- agg10[agg10$genre == "hiphop" | agg10$genre == "reggae",]
+
+qplot(agg10$En2, agg10$En8, colour = agg10$genre, xlim = c(0,15))
+```
+
+Here we have a not an easy way to separate the hiphop and reggae, because the two genres share some features and it would be tricky to find an hyperplane to clusterize them in a perfect way. With a little bit of tolerance, they can be separated. 
+
+
+Finally, we can conlude that the unsupervised learning (clustering) isn't so accurate as the supervised classification with Random Forest.
+
+
+### 3 - Prediction on new data
+
+We build two functions to do new predictions faster and more simply. These are equal to previous work.
+
+The first one compute feature dataframe taking in input the new songs' names. Moreover it returns the "len_seqs" variable to rebuild the songs from their sequences
+
+```{r}
+load_new_data <- function(songs_vec){
+  n_songs <- length(songs_vec)
+  
+  len_seqs_new <- c()
+  res_new <- load_and_STFT(songs_vec[1])
+  feat_df_new <- build_feature_df(res_new)
+  
+  n_seqs_new <- dim(t(res_new$coef))[1]
+  len_seqs_new <- c(len_seqs_new, rep(1, n_seqs_new) )
+  
+  if(n_songs > 1){
+    # add all other coefficients and labels
+    for(i in 2:n_songs){
+      res_new <- load_and_STFT(songs_vec[i])
+      feat_df_temp_new <- build_feature_df(res_new)
+      n_seqs_new <- dim(t(res_new$coef))[1]
+      
+      feat_df_new <- rbind(feat_df_new, feat_df_temp_new)
+      
+      # song identifier to rebuilt the sequences for each song
+      len_seqs_new <- c(len_seqs_new, rep(i, n_seqs_new) )
+    }
+  }
+  names(feat_df_new) <- c("En1", "En2", "En3", "En4", "En5", "En6", "En7", "En8",
+                          "MinRe", "MaxRe", "MeanRe", "SdRe", "ZcrRe",
+                          "MinIm", "MaxIm", "MeanIm", "SdIm", "ZcrIm")
+  return(list("df"=feat_df_new, "len_seqs"=len_seqs_new))
+}
+```
+
+
+The second one takes the songs' names, the labels of the songs and return:
+
+- The accuracy of the new prediction
+- The confusion matrix of the new prediction
+
+```{r}
+predict_new_data <- function(names_songs, name_label, data=feat_df){
+  result <- load_new_data(names_songs)
+  new_data <- result$df
+  len_seqs_new <- result$len_seqs
+  
+  # Build the model with old data
+  mod_rf <- randomForest(id ~ ., data = data, importance = TRUE, mtry=10)
+  # predict on new data
+  pred_rf = predict(mod_rf, new_data)
+  
+  # see the results
+  final_pred_RF <- get_majority(pred_rf,len_seqs_new)
+  Acc <- 100 - mean(final_pred_RF != name_label)*100
+  conf_mat <- table(final_pred_RF, name_label)
+  
+  return(list("Accuracy"=Acc, "Conf.Mat" = conf_mat))
+}
+```
+
+
+Here an example to do prediction on new variable with Random Forest that is the best model we have. As example we do prediction on the last 10 songs (we know we will have an overfitted reult is just for example)
+
+```{r NEW_PRED}
+songs_new <- c("hw_data/f141.au", "hw_data/f142.au", "hw_data/f143.au", "hw_data/f144.au", 
+               "hw_data/f145.au", "hw_data/f146.au", "hw_data/f147.au", "hw_data/f148.au", 
+               "hw_data/f149.au", "hw_data/f150.au")
+
+lab_file <- c("hiphop", "metal", "metal", "rock", "country", "country", "hiphop", "hiphop", "country", "metal")
+
+results <- predict_new_data(names_songs=songs_new, name_label=lab_file)
+
+print(paste("Accuracy is:", as.character(results$Accuracy)))
+results$Conf.Mat
+```
+
+
+
+
+------
+## Part 2
+
+
+#### Load libraries
+
+```{r, warning=FALSE, message=FALSE}
+suppressMessages(require(caret))
+suppressMessages(require(mgcv))
+suppressMessages(require(sfsmisc))
+suppressMessages(require(SAM))
+suppressMessages(require(stats))
+```
+
+### **The implementation of the basic backfitting algorithm with a smoothing method as single-bandwidth method.**
+
+The function **backfitting.algo** is an implementation of the backfitting algorithm. For the smoothing method we are using a cubic smoothing spline. The function takes as an input:
+
+* $Y$ - the response vector, 
+* $X$ - the (n x d) matrix, where each row corresponds to an observation whereas each column to a covariate,
+* $\lambda$ - the smoothing parameter,
+* $tol$ - the threshold for which the estimate does not change,
+* $max.iter$ - the maximum number of iterations.
+
+```{r}
+backfitting.algo <- function(Y, X, lambdaa, tol=1e-6, max.iter = 500){
+  if (!is.matrix(X)) return("X must be the (n x d) matrix ")
+  if (!is.vector(Y)) return("Y must be a vector ")
+  
+  n <- nrow(X)
+  d <- ncol(X)
+  iter <- 1
+  alpha <- mean(Y)
+  # residual sum of squares of the initial estimate
+  rss0 <- sum((Y - alpha)^2)
+  
+  # per j=1
+  resj1 <- Y - alpha
+  m1 <- smooth.spline(X[, 1], resj1 , lambda = lambdaa)
+  m1$fit$coef[1] <- m1$fit$coef[1] - mean(m1$y)
+  
+  # per j=2
+  resj2 <- Y - alpha - stats:::predict.smooth.spline(m1,X[,1])$y
+  m2 <- smooth.spline(X[, 2], resj2 , lambda = lambdaa)
+  m2$fit$coef[1] <- m2$fit$coef[1] - mean(m2$y)
+  
+  # calcoliamo l'errore
+  m_xj1 <- stats:::predict.smooth.spline(m1,X[, 1])$y
+  m_xj2 <- stats:::predict.smooth.spline(m2,X[, 2])$y
+  rss0 <- sum((Y - (rep(alpha,length(m_xj1)) + m_xj1 + m_xj2))^2)
+  
+  # salviamo gli smoother
+  smoother <- list(m1, m2)
+  
+  # ripetiamo fino a convergenza
+  done = TRUE
+  while (done & iter < max.iter) {
+    for(j in 1:d){
+      resj <- rep(0, d-1)
+      for(jj in 1:d){
+        if(jj != j){
+          resj <- resj + stats:::predict.smooth.spline(smoother[[jj]],X[,jj])$y
+        }
+      }
+      resj <- Y - alpha - resj
+      # smoothing:
+      mj <- smooth.spline(X[, j], resj, lambda = lambdaa)
+      mj$fit$coef[1] <- mj$fit$coef[1] - mean(mj$y)
+      smoother[[j]] <- mj
+    }
+    # update rss
+    m_xj1 <- stats:::predict.smooth.spline(smoother[[1]],X[, 1])$y
+    m_xj2 <- stats:::predict.smooth.spline(smoother[[2]],X[, 2])$y
+    
+    rss <- sum((Y - (rep(alpha,length(m_xj1)) + m_xj1 + m_xj2))^2)
+    
+    if (abs(rss-rss0) < tol*rss) done=FALSE
+    rss0 <- rss
+    iter <- iter + 1
+  }
+  
+  return(smoother)
+}
+```
+
+
+### **Applying code to data** 
+
+Data from **ore.RData** contain 38 observations with two feature columns: __t1, t2__ and the response vector __width__.
+
+```{r}
+# loading data
+load("ore.RData")
+str(ore)
+```
+
+The next step is to find a common smoothing parameter via a global CV to choose a bandwidth $\lambda$. 
+
+```{r, cache=TRUE}
+#building a response vector
+Y <- ore$width
+n <- length(Y)
+d <- dim(ore)[2]-1
+# building data matrix
+X <- matrix(NA, nrow = n, ncol = d)
+X[,1] <- ore$t1
+X[,2] <- ore$t2
+
+# scaling
+X <- scale(X, scale = apply(X, 2, sd, na.rm = TRUE), center = FALSE)
+
+grid <- seq(from=0.001, to=1, length.out = 50)
+kk <- 5  #number of folds
+cv_splits <- createFolds(Y, k = kk, returnTrain = TRUE)
+pred_error = rep(NA,length(grid))
+
+for(i in 1:length(grid)){
+  error_for_lambda <- 0
+  for(fold in names(cv_splits)){
+    X_train <- X[cv_splits[fold][[1]],]
+    Y_train <- Y[cv_splits[fold][[1]]]
+    X_test <- X[-cv_splits[fold][[1]],]
+    Y_test <- Y[-cv_splits[fold][[1]]]
+    smoother <- backfitting.algo(Y=Y_train, X=X_train, lambdaa = grid[i]) 
+    
+    # usiamo gli smoother sui dati del test
+    m_xj1 <- stats:::predict.smooth.spline(smoother[[1]],X_test[,1])$y
+    m_xj2 <- stats:::predict.smooth.spline(smoother[[2]],X_test[,2])$y
+    
+    # y predette sul test
+    Y_pred <- mean(Y_train) + (m_xj1 + m_xj2)
+    
+    error_for_lambda = error_for_lambda + sum( (Y_pred - Y_test)^2 )
+  }
+  pred_error[i] <- error_for_lambda/kk
+}
+
+lambda_hat <- grid[which.min(pred_error)]
+lambda_hat
+```
+
+The comparison between the true response vector and predicted values with the use of the most optimal $\hat\lambda$.
+
+```{r}
+smoother_opt <- backfitting.algo(Y, X, lambdaa = lambda_hat)
+
+m_xj1 <- stats:::predict.smooth.spline(smoother_opt[[1]],X[,1])$y
+m_xj2 <- stats:::predict.smooth.spline(smoother_opt[[2]],X[,2])$y
+
+Y_pred_opt <- mean(Y) + (m_xj1 + m_xj2)
+
+
+## True target values vs. the predicted using a backfitting algorithm
+cbind(true_target= c(Y), Predicted_bf=c(round(Y_pred_opt, 2)))  
+```
+
+
+### **Comparison of the results with those obtained using the mgcv package.**
+
+
+```{r}
+par(mfrow=c(2,2))
+
+res.gam <- gam(Y ~ s(X[,1]) + s(X[,2]), data = ore)
+plot(X[,1],m_xj1,col="blue", main="Feature 1 via Backfitting")
+plot(X[,2],m_xj2,col = "red", main="Feature 2 via Backfitting")
+plot(res.gam)
+```
+
+
+### **Sparse addittive models**
+
+The function **SpAM.algo** sparsify the basic backfitting algorithm by killing (setting to 0) some of the component functions $m_j()$. The function takes in input:
+
+* $Y$ - the response vector, 
+* $X$ - the (n x d) matrix, where each row corresponds to an observation whereas each column to a covariate,
+* lambdaa - the smoothing parameter,
+* lambdaa_killer - the smoothing factor for the thresholding,
+* $tol$ - the threshold for which the estimate does not change,
+* $max.iter$ - the maximum number of iterations.
+
+
+```{r}
+SpAM.algo <- function(X, Y, lambdaa, lambdaa_killer, tol=1e-6, max.iter=200){
+  # questa volta lambdaa è una lista di lambda per ogni j
+  
+  if (!is.matrix(X)) return("X must be the (n x d) matrix ")
+  if (!is.vector(Y)) return("Y must be a vector ")
+  
+  n <- nrow(X)
+  d <- ncol(X)
+  iter <- 1
+  alpha <- mean(Y)
+  # residual sum of squares of the initial estimate
+  rss0 <- sum((Y - alpha)^2)
+  
+  
+  ################# FIRST ITERATION ##################
+  
+  smoother = vector("list", 1)
+  
+  # per j=1
+  resj1 <- Y - alpha
+  m1 <- smooth.spline(X[, 1], resj1 , lambda = lambdaa)
+  l1<-sqrt(mean(m1$y^2))
+  
+  cond <- 1-lambdaa_killer/l1
+  if(cond <= 0){ m1$fit$coef = rep(0, length(m1$fit$coef)) }else
+  { m1$fit$coef = m1$fit$coef * cond }
+  
+  m1$fit$coef[1] <- m1$fit$coef[1] - mean(m1$y)
+  
+  smoother[[1]] <- m1
+  
+  # per j>1
+  for(j in 2:d){
+    resj <- rep(0, n)
+    pos <- 1
+    for(smooth in smoother){
+      ciccio <- stats:::predict.smooth.spline(smooth,X[,pos])$y
+      resj <- resj + ciccio
+      pos <- pos + 1
+    }
+    resj <- Y - alpha - resj
+    # smoothing:
+    mj <- smooth.spline(X[, j], resj, lambda = lambdaa)
+    
+    lj<-sqrt(mean(mj$y^2))
+    
+    cond <- 1-lambdaa_killer/lj
+    if(cond <= 0){ mj$fit$coef = rep(0, length(mj$fit$coef)) }else
+    { mj$fit$coef = mj$fit$coef * cond }
+    
+    mj$fit$coef[1] <- mj$fit$coef[1] - mean(mj$y)
+    smoother[[j]] <- mj
+  }
+  # calcoliamo l'errore
+  prev <- Y - alpha
+  for(j in 1:d){
+    prev <- prev - stats:::predict.smooth.spline(smoother[[j]],X[, j])$y
+  }
+  rss0 <- sum(prev^2)
+  
+  
+  ################# OTHER ITERATIONS ##################
+  
+  done = TRUE
+  while (done & iter < max.iter) {
+    for(j in 1:d){
+      resj <- rep(0, n)
+      for(jj in 1:d){
+        if(jj != j){
+          ciccio <- stats:::predict.smooth.spline(smoother[[jj]],X[,jj])$y
+          resj <- resj + ciccio
+        }
+      }
+      resj <- Y - alpha - resj
+      # smoothing:
+      mj <- smooth.spline(X[, j], resj, lambda = lambdaa)
+      
+      lj<-sqrt(mean(mj$y^2))
+      
+      cond <- 1-lambdaa_killer/lj
+      if(cond <= 0){ mj$fit$coef = rep(0, length(mj$fit$coef)) }else
+      { mj$fit$coef = mj$fit$coef * cond }
+      
+      mj$fit$coef[1] <- mj$fit$coef[1] - mean(mj$y)
+      
+      smoother[[j]] <- mj
+    }
+    # update rss
+    
+    # calcoliamo l'errore
+    prev <- Y - alpha
+    for(j in 1:d){
+      prev <- prev - stats:::predict.smooth.spline(smoother[[j]],X[, j])$y
+    }
+    rss <- sum(prev^2)
+    
+    if (abs(rss-rss0) < tol*rss) done=FALSE
+    rss0 <- rss
+    iter <- iter + 1
+  }
+  
+  return(smoother)
+}
+```
+
+
+### Testing:
+
+```{r}
+# Generating training data
+n = 150; d = 200
+X.tr = 0.5*matrix(runif(n*d),n,d) + matrix(rep(0.5*runif(n),d),n,d)
+
+# Generating response
+y.tr = -2*sin(X.tr[,1]) + X.tr[,2]^2-1/3 + X.tr[,3]-1/2 + exp(-X.tr[,4]) + exp(-1)-1
+
+# Generating testing data
+n = 500; d = 200
+X.te = 0.5*matrix(runif(n*d),n,d) + matrix(rep(0.5*runif(n),d),n,d)
+
+# Generating response
+y.te = -2*sin(X.te[,1]) + X.te[,2]^2-1/3 + X.te[,3]-1/2 + exp(-X.te[,4]) + exp(-1)-1
+```
+
+
+Now we run the main corpus as we done above for the backfitting, performing a 10 CV for tuning lambda of the smoothing splines and the lambda_killer for the soft_thresholding.
+We use 2 different grids for each one because we see that if lambda_killer is too small the computation time increase drammatically. So we consider a grid of only 3 elements, not too small for lambda_killer and a grid of 5 elements for the other lambda.
+
+This piece takes some hours to run, so we decide to put it in "eval=FALSE" and just put an image of the errors table. In this way the knit is faster.
+
+```{r, eval=FALSE}
+#data
+X <- X.tr
+Y <- y.tr
+
+# scaling
+X <- scale(X, scale = apply(X, 2, sd, na.rm = TRUE), center = FALSE)
+
+grid1 <- seq(from=0.1, to=1, length.out = 3)
+grid2 <- seq(from=0.01, to=1, length.out = 5)
+kk <- 10  #number of folds
+cv_splits <- createFolds(Y, k = kk, returnTrain = TRUE)
+pred_error = matrix(NA, nrow = length(grid2), ncol = length(grid1))
+for(k in 1:length(grid1)){
+  for(i in 1:length(grid2)){
+    error_for_lambda <- 0
+    for(fold in names(cv_splits)){
+      X_train <- X[cv_splits[fold][[1]],]
+      Y_train <- Y[cv_splits[fold][[1]]]
+      X_test <- X[-cv_splits[fold][[1]],]
+      Y_test <- Y[-cv_splits[fold][[1]]]
+      smoother <- SpAM.algo(Y=Y_train, X=X_train, lambdaa = grid2[i], lambdaa_killer = grid1[k])
+      
+      # usiamo gli smoother sui dati del test
+      m_xj <- 0
+      for(j in 1:d){
+        m_xj <- m_xj + stats:::predict.smooth.spline(smoother[[j]],X_test[,j])$y
+      }
+      
+      # y predette sul test
+      Y_pred <- mean(Y_train) + m_xj
+      
+      error_for_lambda = error_for_lambda + sum( (Y_pred - Y_test)^2 )
+    }
+    pred_error[i,k] <- error_for_lambda/kk
+  }
+}
+index_hat <- which.min(pred_error)
+```
+
+
+In the end we can see the table with the errors and we can choose the optimized lambdas.
+
+<center>![Table of errors](error_table.png)</center>
+
+
+
+The comparison between the true response vector and predicted values with the use of the most optimal lambdas.
+
+```{r}
+lambdaa_hat <- 0.01
+lambdaa_killer_hat <- 0.1
+
+smoother_opt <- SpAM.algo(Y=y.tr, X=X.tr, lambdaa = lambdaa_hat, lambdaa_killer = lambdaa_killer_hat)
+
+
+m_xj <- 0
+
+for(j in 1:d){
+  m_xj <- m_xj + stats:::predict.smooth.spline(smoother_opt[[j]],X.te[,j])$y
+}
+
+Y_pred_opt <- mean(y.tr) + m_xj
+
+
+## True target values vs. the predicted using a backfitting algorithm
+head(cbind(true_target= c(round((y.te),3)), Predicted_bf=c(round(Y_pred_opt, 3))))
+```
+
+
+
+
+
