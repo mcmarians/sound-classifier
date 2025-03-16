@@ -17,6 +17,6 @@ The dataset consist in 150 songs with their labels:
 
 ## Results
 
-I tried different models for the classification and we obtain accuracy value taking the most common label of sequences for each songs. The final result we obtained is an accuracy of 94 % using random forest algorithm.
+I tried different models for the classification and I obtained accuracy value taking the most common label of sequences for each songs. The final result I obtained is an accuracy of 94 % using random forest algorithm.
 
 The project is developed in R.
